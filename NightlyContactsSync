@@ -552,6 +552,27 @@ function deskClient_() {
 
 /* ================= Notion Client ================= */
 
+function debugNotionContactsDbSchema_() {
+  const token = getProp_("NOTION_TOKEN");
+  const contactsDbId = getProp_("NOTION_CONTACTS_DB_ID");
+
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "Notion-Version": NOTION_VERSION,
+    "Content-Type": "application/json"
+  };
+
+  const db = fetchJson_(`https://api.notion.com/v1/databases/${contactsDbId}`, "get", headers, null, 3, 600);
+  const dbTitle = (db.title || []).map(t => t.plain_text || "").join("");
+  console.log(`Contacts DB title="${dbTitle}" id=${db.id || contactsDbId}`);
+
+  const props = db.properties || {};
+  Object.keys(props).forEach(name => {
+    const type = props[name]?.type || "unknown";
+    console.log(`Property "${name}" type="${type}"`);
+  });
+}
+
 function notionClient_() {
   const token = getProp_("NOTION_TOKEN");
   const contactsDbId = getProp_("NOTION_CONTACTS_DB_ID");
@@ -566,9 +587,25 @@ function notionClient_() {
 
   function assertDeskIdPropertyExists_() {
     const db = fetchJson_(`https://api.notion.com/v1/databases/${contactsDbId}`, "get", headers, null, 3, 600);
-    const prop = db.properties && db.properties[CONTACT_DESK_ID_PROP];
+    const props = db.properties || {};
+    const prop = props[CONTACT_DESK_ID_PROP];
+    const dbTitle = (db.title || []).map(t => t.plain_text || "").join("");
+    const dbId = db.id || contactsDbId;
+    const sortedPropNames = Object.keys(props).sort();
+    const normalizedTarget = (CONTACT_DESK_ID_PROP || "").trim().toLowerCase();
     if (!prop || prop.type !== "number") {
-      throw new Error(`Notion Contacts DB missing required number property "${CONTACT_DESK_ID_PROP}"`);
+      console.log(`Contacts DB title="${dbTitle}" id=${dbId}`);
+      console.log(`Properties (${sortedPropNames.length}): ${sortedPropNames.join(", ")}`);
+      if (!prop) {
+        const nearMatches = sortedPropNames.filter(n => (n || "").trim().toLowerCase() === normalizedTarget);
+        if (nearMatches.length) {
+          console.log(`Near-matching property names for "${CONTACT_DESK_ID_PROP}": ${nearMatches.join(", ")}`);
+        }
+      } else {
+        console.log(`Actual type for "${CONTACT_DESK_ID_PROP}": ${prop.type}`);
+      }
+      const actualType = prop ? `"${prop.type || "unknown"}"` : "missing";
+      throw new Error(`Required Notion property "${CONTACT_DESK_ID_PROP}" must be type "number" (actual: ${actualType})`);
     }
   }
 
