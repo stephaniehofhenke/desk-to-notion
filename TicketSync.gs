@@ -11,6 +11,10 @@
 
 /* ============================= Config ============================= */
 
+// Optional: hard-code the Clients DB ID for troubleshooting to bypass Script Properties.
+// Leave blank to use the value from Script Properties.
+var CLIENTS_DB_ID_OVERRIDE = "2bef5364-d1df-8001-9ed9-e137d9409b1a";
+
 function getConfig_() {
   const props = PropertiesService.getScriptProperties();
   const required = [
@@ -35,8 +39,12 @@ function getConfig_() {
     if (v === null || v === undefined || v === "") {
       throw new Error("Missing Script Property: " + k);
     }
-    cfg[k] = v;
+    cfg[k] = typeof v === "string" ? v.trim() : v;
   });
+
+  if (CLIENTS_DB_ID_OVERRIDE) {
+    cfg.NOTION_CLIENTS_DB_ID = CLIENTS_DB_ID_OVERRIDE.trim();
+  }
 
   cfg.BACKFILL_DAYS = Number(cfg.BACKFILL_DAYS);
   cfg.POLLING_ENABLED = String(cfg.POLLING_ENABLED).toLowerCase() === "true";
