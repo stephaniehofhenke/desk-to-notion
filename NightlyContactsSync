@@ -56,7 +56,12 @@ function nightlyContactsSync_dryRun() {
 
 function nightlyContactsSync_apply() {
   SYNC.DRY_RUN = false;
-  nightlyContactsSync_();
+  try {
+    nightlyContactsSync_();
+  } catch (err) {
+    notifyFailure_("nightlyContactsSync_apply", err);
+    throw err;
+  }
 }
 
 // One-time cleanup that backfills Desk Contact IDs on existing Notion contacts.
@@ -67,7 +72,27 @@ function cleanupContactsSync_dryRun() {
 
 function cleanupContactsSync_apply() {
   SYNC.DRY_RUN = false;
-  cleanupContactsSync_();
+  try {
+    cleanupContactsSync_();
+  } catch (err) {
+    notifyFailure_("cleanupContactsSync_apply", err);
+    throw err;
+  }
+}
+
+function notifyFailure_(functionName, err) {
+  const subject = "🚨 Nightly Contact Sync Failed";
+  const errorMessage = err && err.message ? err.message : String(err);
+  const stack = err && err.stack ? err.stack : "(no stack trace)";
+  const timestamp = new Date().toISOString();
+  const body = [
+    `Function: ${functionName}`,
+    `Timestamp: ${timestamp}`,
+    `Error: ${errorMessage}`,
+    `Stack: ${stack}`,
+  ].join("\n");
+
+  MailApp.sendEmail("support@stringmarketing.com", subject, body);
 }
 
 function nightlyContactsSync_() {
