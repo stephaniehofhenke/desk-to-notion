@@ -105,7 +105,7 @@ function nightlyContactsSync_() {
       processed++;
       console.log(`\n--- Client: ${clientName} | Desk Company ID: ${deskCompanyId} ---`);
 
-      // Load Notion related contacts for this client
+      // Load Notion related contacts for this client (read-only; relation is not synced)
       const contactPageIds = notion.getRelationIds_(props[CLIENTS_CONTACTS_REL_PROP]);
       const notionContacts = notion.fetchPages(contactPageIds);
 
@@ -215,8 +215,7 @@ function nightlyContactsSync_() {
               continue;
             }
 
-            console.log(`Relate existing Notion contact by email: ${email} → ${clientName} | deskId=${dc.id}`);
-            if (!SYNC.DRY_RUN) notion.addContactToClientRelation(clientPageId, existingByEmail.id);
+            console.log(`Found existing Notion contact by email; leaving client relation unchanged: ${email} → ${clientName} | deskId=${dc.id}`);
             notionEmailSet.add(email);
             continue;
           }
@@ -240,7 +239,6 @@ function nightlyContactsSync_() {
                 console.log(`No empty email slots; creating new contact: ${email} | deskId=${dc.id}`);
                 const title = buildName_(dc.firstName, dc.lastName, email) || email;
                 const newId = notion.createContact(title, email, dc.id);
-                notion.addContactToClientRelation(clientPageId, newId);
               }
             }
 
@@ -253,8 +251,7 @@ function nightlyContactsSync_() {
           const title = buildName_(dc.firstName, dc.lastName, email) || email;
           console.log(`Create Notion contact (new) from Desk: ${email} (${title}) | deskId=${dc.id}`);
           if (!SYNC.DRY_RUN) {
-            const newId = notion.createContact(title, email, dc.id);
-            notion.addContactToClientRelation(clientPageId, newId);
+            notion.createContact(title, email, dc.id);
           }
           notionEmailSet.add(email);
 
@@ -633,20 +630,6 @@ function notionClient_() {
         properties
       }, 3, 600);
       return res.id;
-    },
-
-    addContactToClientRelation: (clientPageId, contactPageId) => {
-      const client = fetchJson_(`https://api.notion.com/v1/pages/${clientPageId}`, "get", headers, null, 3, 600);
-      const rel = (client.properties &&
-        client.properties[CLIENTS_CONTACTS_REL_PROP] &&
-        client.properties[CLIENTS_CONTACTS_REL_PROP].relation) || [];
-      const ids = rel.map(r => r.id);
-      if (ids.includes(contactPageId)) return;
-
-      const newRel = ids.concat([contactPageId]).map(id => ({ id }));
-      fetchJson_(`https://api.notion.com/v1/pages/${clientPageId}`, "patch", headers, {
-        properties: { [CLIENTS_CONTACTS_REL_PROP]: { relation: newRel } }
-      }, 3, 600);
     },
 
     // Never overwrites Contact Name; only fills empty email slots
