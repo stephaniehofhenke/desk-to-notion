@@ -376,13 +376,13 @@ function NotionClient_(cfg) {
 
 function pickName_(v) {
   if (!v) return "";
-  if (typeof v === "string") return v;
+  if (typeof v === "string") return v.trim();
   if (typeof v === "number") return String(v);
   if (typeof v === "object") {
-    if (v.name) return String(v.name);
-    if (v.title) return String(v.title);
-    if (v.label) return String(v.label);
-    if (v.value) return String(v.value);
+    if (v.name) return String(v.name).trim();
+    if (v.title) return String(v.title).trim();
+    if (v.label) return String(v.label).trim();
+    if (v.value) return String(v.value).trim();
   }
   return "";
 }
@@ -411,12 +411,18 @@ function mapDeskTicketToNotionProps_(ticket, related, cfg) {
 
   var statusName = pickName_(ticket.status);
   var priorityName = pickName_(ticket.priority);
+  var tagNames = (ticket.tags || []).map(function (t) { return pickName_(t); })
+    .filter(function (s) { return s && s.length; });
+
+  var dedup = {};
+  tagNames.forEach(function (n) { dedup[n] = true; });
+  tagNames = Object.keys(dedup);
 
   props["Ticket ID"] = { number: Number(ticket.id) };
   props["Subject"] = { title: [{ type: "text", text: { content: ticket.subject || "(No subject)" } }] };
   props["Status"] = statusName ? { select: { name: statusName } } : { select: null };
   props["Priority"] = priorityName ? { select: { name: priorityName } } : { select: null };
-  props["Tags"] = { multi_select: (ticket.tags || []).map(function (t) { return { name: t }; }) };
+  props["Tags"] = { multi_select: tagNames.map(function (n) { return { name: n }; }) };
   var ticketLink = buildTicketUrl_(ticket, cfg);
   props["Ticket Link"] = ticketLink ? { url: ticketLink } : { url: null };
   props["Date Created"] = ticket.createdAt ? { date: { start: ticket.createdAt } } : { date: null };
@@ -453,7 +459,7 @@ function mapDeskTicketToNotionProps_(ticket, related, cfg) {
     props["Review"] = { select: { name: "Complete" } };
   }
 
-  return props;
+  return { properties: props, tagNames: tagNames };
 }
 
 /* ============================= Sync Engine ============================= */
@@ -603,14 +609,16 @@ function SyncEngine_(cfg, desk, notion) {
       projectIds: resolveProjects_(ticket)
     };
 
-    var properties = mapDeskTicketToNotionProps_(ticket, related, cfg);
+    var mapped = mapDeskTicketToNotionProps_(ticket, related, cfg);
+    var properties = mapped.properties || mapped;
+    var tagNames = mapped.tagNames || [];
     Logger.log("Ticket " + ticket.id + " Ticket Link => " + JSON.stringify(properties["Ticket Link"]));
+    Logger.log("Ticket " + ticket.id + " raw tags=" + JSON.stringify(ticket.tags) + " mapped tags=" + JSON.stringify(tagNames));
 
     var statusProp = properties["Status"];
     var statusNameMapped = statusProp && statusProp.select ? statusProp.select.name : "";
     notion.ensureSelectOption(cfg.NOTION_DB_TICKETS, "Status", statusNameMapped);
 
-    var tagNames = (ticket.tags || []).map(function (t) { return String(t || "").trim(); });
     notion.ensureMultiSelectOptions(cfg.NOTION_DB_TICKETS, "Tags", tagNames);
 
     var existing = findTicketPage_(ticket.id);
