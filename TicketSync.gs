@@ -737,22 +737,104 @@ function SyncEngine_(cfg, desk, notion) {
   }
 
   function backfillLastNDays_() {
-    var days = cfg.BACKFILL_DAYS || 120;
-    var sinceDate = new Date();
-    sinceDate.setDate(sinceDate.getDate() - days);
-    var iso = sinceDate.toISOString();
+    var props = PropertiesService.getScriptProperties();
+    var MAX_MS = 5 * 60 * 1000; // 5 minutes safety threshold
+    var startMs = Date.now();
 
-    var page = 1;
-    var hasMore = true;
-    while (hasMore) {
-      var res = desk.listTickets({ inboxId: cfg.SYNC_INBOX_NAME_OR_ID, updatedSince: iso, page: page, pageSize: 100 });
-      var tickets = res.tickets || res.data || [];
-      tickets.forEach(function (t) {
-        upsertTicket_(t);
-      });
-      hasMore = res.has_more || res.hasMore || (tickets.length === 100);
-      page++;
+    var cursorPage = props.getProperty("BACKFILL_CURSOR_PAGE");
+    var cursorUpdatedSince = props.getProperty("BACKFILL_CURSOR_UPDATED_SINCE");
+    var doneFlag = props.getProperty("BACKFILL_DONE");
+    var startedAt = props.getProperty("BACKFILL_STARTED_AT");
+
+    if (!cursorPage || String(doneFlag) !== "false") {
+      var now = new Date();
+      var sinceDate = new Date();
+      sinceDate.setDate(sinceDate.getDate() - (cfg.BACKFILL_DAYS || 120));
+      cursorUpdatedSince = sinceDate.toISOString();
+      cursorPage = "1";
+      startedAt = now.toISOString();
+
+      props.setProperties({
+        BACKFILL_CURSOR_PAGE: cursorPage,
+        BACKFILL_CURSOR_UPDATED_SINCE: cursorUpdatedSince,
+        BACKFILL_DONE: "false",
+        BACKFILL_STARTED_AT: startedAt
+      }, false);
+      props.deleteProperty("BACKFILL_LAST_TICKET_ID");
     }
+
+    if (!startedAt) {
+      startedAt = new Date().toISOString();
+      props.setProperty("BACKFILL_STARTED_AT", startedAt);
+    }
+
+    var page = Number(cursorPage) || 1;
+    var iso = cursorUpdatedSince;
+    console.log(JSON.stringify({
+      level: "info",
+      message: "Backfill run started",
+      updatedSince: iso,
+      page: page,
+      startedAt: startedAt
+    }));
+
+    var res = desk.listTickets({ inboxId: cfg.SYNC_INBOX_NAME_OR_ID, updatedSince: iso, page: page, pageSize: 100 });
+    var tickets = res.tickets || res.data || [];
+    var lastTicketId = null;
+    for (var i = 0; i < tickets.length; i++) {
+      var t = tickets[i];
+      upsertTicket_(t);
+      lastTicketId = t.id || t.ticketId || t.ticket_id || null;
+
+      if ((Date.now() - startMs) > MAX_MS) {
+        props.setProperties({
+          BACKFILL_CURSOR_PAGE: String(page),
+          BACKFILL_CURSOR_UPDATED_SINCE: iso,
+          BACKFILL_DONE: "false",
+          BACKFILL_LAST_TICKET_ID: lastTicketId ? String(lastTicketId) : ""
+        }, false);
+        console.log(JSON.stringify({
+          level: "info",
+          message: "Backfill paused due to time limit",
+          lastTicketId: lastTicketId,
+          nextPage: page
+        }));
+        return;
+      }
+    }
+
+    var hasMore = res.has_more || res.hasMore || (tickets.length === 100);
+    if (hasMore) {
+      var nextPage = page + 1;
+      props.setProperties({
+        BACKFILL_CURSOR_PAGE: String(nextPage),
+        BACKFILL_CURSOR_UPDATED_SINCE: iso,
+        BACKFILL_DONE: "false",
+        BACKFILL_LAST_TICKET_ID: lastTicketId ? String(lastTicketId) : ""
+      }, false);
+      console.log(JSON.stringify({
+        level: "info",
+        message: "Backfill page processed; continuing next run",
+        nextPage: nextPage,
+        updatedSince: iso,
+        lastTicketId: lastTicketId
+      }));
+      return;
+    }
+
+    var startedDate = startedAt ? new Date(startedAt) : new Date();
+    var durationMs = Date.now() - startedDate.getTime();
+    props.setProperty("BACKFILL_DONE", "true");
+    props.deleteProperty("BACKFILL_CURSOR_PAGE");
+    props.deleteProperty("BACKFILL_CURSOR_UPDATED_SINCE");
+    props.deleteProperty("BACKFILL_LAST_TICKET_ID");
+    props.deleteProperty("BACKFILL_STARTED_AT");
+    console.log(JSON.stringify({
+      level: "info",
+      message: "Backfill completed",
+      startedAt: startedAt,
+      durationMs: durationMs
+    }));
   }
 
   return {
@@ -795,5 +877,5 @@ function pollDeskForChanges() {
 }
 
 function backfillLastNDays() {
-  getEngine_().backfillLastNDays();
+  return getEngine_().backfillLastNDays();
 }
