@@ -142,7 +142,16 @@ function TeamworkDeskClient_(cfg) {
 
   function getTicketTasks_(ticketId) {
     var url = base + "/tickets/" + encodeURIComponent(String(ticketId)) + "/tasks.json";
-    return fetchWithBackoff_(url, { method: "get", headers: headers, muteHttpExceptions: true }, cfg.RATE_LIMIT_RETRIES, cfg.RATE_LIMIT_BASE_BACKOFF_MS);
+    try {
+      return fetchWithBackoff_(url, { method: "get", headers: headers, muteHttpExceptions: true }, cfg.RATE_LIMIT_RETRIES, cfg.RATE_LIMIT_BASE_BACKOFF_MS);
+    } catch (err) {
+      var msg = String(err);
+      if (msg.indexOf("HTTP 404") !== -1 && msg.indexOf("/tasks.json") !== -1) {
+        Logger.log("Desk tasks not found for ticket " + ticketId + " (treating as empty).");
+        return { tasks: [], data: [] };
+      }
+      throw err;
+    }
   }
 
   return {
@@ -421,18 +430,19 @@ function SyncEngine_(cfg, desk, notion) {
 
   function resolveProjects_(ticket) {
     var ids = [];
+    var notionIds = [];
     if (ticket.project && ticket.project.id) ids.push(ticket.project.id);
 
     if (!ids.length) {
       var tasks = desk.getTicketTasks(ticket.id);
       var included = (tasks.tasks || tasks.data || []);
+      if (!included || !included.length) return notionIds;
       for (var i = 0; i < included.length; i++) {
         var t = included[i];
         if (t.projectId && ids.indexOf(t.projectId) === -1) ids.push(t.projectId);
       }
     }
 
-    var notionIds = [];
     ids.forEach(function (pid) {
       var res = notion.queryByNumber(cfg.NOTION_DB_PROJECTS, "Project ID", pid);
       if (res.results && res.results.length) {
