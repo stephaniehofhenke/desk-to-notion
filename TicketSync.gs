@@ -281,14 +281,30 @@ function NotionClient_(cfg) {
 
 /* ============================== Mappers ============================== */
 
+function pickName_(v) {
+  if (!v) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "number") return String(v);
+  if (typeof v === "object") {
+    if (v.name) return String(v.name);
+    if (v.title) return String(v.title);
+    if (v.label) return String(v.label);
+    if (v.value) return String(v.value);
+  }
+  return "";
+}
+
 function mapDeskTicketToNotionProps_(ticket, related, cfg) {
   var props = {};
   var needsReview = false;
 
+  var statusName = pickName_(ticket.status);
+  var priorityName = pickName_(ticket.priority);
+
   props["Ticket ID"] = { number: Number(ticket.id) };
   props["Subject"] = { title: [{ type: "text", text: { content: ticket.subject || "(No subject)" } }] };
-  props["Status"] = ticket.status ? { select: { name: ticket.status } } : { select: null };
-  props["Priority"] = ticket.priority ? { select: { name: ticket.priority } } : { select: null };
+  props["Status"] = statusName ? { select: { name: statusName } } : { select: null };
+  props["Priority"] = priorityName ? { select: { name: priorityName } } : { select: null };
   props["Tags"] = { multi_select: (ticket.tags || []).map(function (t) { return { name: t }; }) };
   props["Ticket Link"] = ticket.url ? { url: ticket.url } : { url: null };
   props["Date Created"] = ticket.createdAt ? { date: { start: ticket.createdAt } } : { date: null };
@@ -463,6 +479,9 @@ function SyncEngine_(cfg, desk, notion) {
       console.log(JSON.stringify({ level: "info", message: "Ticket ignored (not support inbox or spam)", ticketId: ticket.id }));
       return;
     }
+
+    var statusName = pickName_(ticket.status);
+    Logger.log("Desk ticket status raw=" + JSON.stringify(ticket.status) + " mapped=" + statusName);
 
     var related = {
       clientId: resolveClient_(ticket.company && ticket.company.id),
