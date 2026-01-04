@@ -1,0 +1,620 @@
+/*******************************************************
+ * Nightly Contact Sync (SAFE + Desk-correct search usage)
+ * Notion ↔ Teamwork Desk
+ *
+ * Key guarantees:
+ * - Do NOT overwrite Notion contact titles (Contact Name)
+ * - Prefer adding emails into existing Notion contacts (Secondary, Email 3, Email 4)
+ * - If email exists in Desk anywhere (primary OR contact methods) -> do nothing
+ * - Only create Desk customer if truly missing
+ * - Skip wordpress/webmaster + *.stringmarketing.com subdomain emails
+ *
+ * Desk API usage:
+ * - GET /desk/api/v2/search/customers.json supports includes=contacts and companies[] filters
+ *******************************************************/
+
+const NOTION_VERSION = "2022-06-28";
+
+// ===== Clients DB =====
+const CLIENTS_TITLE_PROP = "Business Name";
+const CLIENTS_CONTACTS_REL_PROP = "Contacts";
+const CLIENTS_DESK_COMPANY_ID_PROP = "Desk Company ID";
+
+// ===== Contacts DB =====
+const CONTACT_TITLE_PROP = "Contact Name";
+const CONTACT_EMAIL_PROP = "Email";
+const CONTACT_EMAIL2_PROP = "Secondary Email";
+const CONTACT_EMAIL3_PROP = "Email 3";
+const CONTACT_EMAIL4_PROP = "Email 4";
+
+// ===== Settings =====
+const SYNC = {
+  DRY_RUN: true,
+  MAX_CLIENTS_PER_RUN: 200,
+  SLEEP_MS: 120,
+  SKIP_COMPANY_NAME: "STRING Marketing",
+
+  IMPORT_DESK_TO_NOTION: true,
+
+  EXCLUDE_CONTAINS: ["wordpress", "webmaster"],
+  SKIP_STRINGMARKETING_SUBDOMAINS: true,
+
+  TRY_SECONDARY_EMAIL_UPDATE: true,
+  REQUIRE_EXACT_NAME_MATCH: true,
+
+  FETCH_RETRIES: 5,
+  FETCH_BACKOFF_MS: 800,
+
+  DESK_PAGE_SIZE: 100, // search paging
+};
+
+function nightlyContactsSync_dryRun() {
+  SYNC.DRY_RUN = true;
+  nightlyContactsSync_();
+}
+
+function nightlyContactsSync_apply() {
+  SYNC.DRY_RUN = false;
+  nightlyContactsSync_();
+}
+
+function nightlyContactsSync_() {
+  const notion = notionClient_();
+  const desk = deskClient_();
+
+  const clientsDbId = getProp_("NOTION_CLIENTS_DB_ID");
+  let cursor = null;
+  let processed = 0;
+
+  console.log("=== Nightly Contact Sync start === DRY_RUN=" + SYNC.DRY_RUN);
+
+  while (true) {
+    const q = { page_size: 100 };
+    if (cursor) q.start_cursor = cursor;
+
+    const res = notion.dbQuery(clientsDbId, q);
+    const pages = res.results || [];
+
+    for (const page of pages) {
+      if (processed >= SYNC.MAX_CLIENTS_PER_RUN) {
+        console.log(`Reached MAX_CLIENTS_PER_RUN=${SYNC.MAX_CLIENTS_PER_RUN}. Re-run to continue.`);
+        return;
+      }
+
+      const props = page.properties || {};
+      const clientPageId = page.id;
+
+      const clientName = notion.getClientTitle_(props) || "(Untitled)";
+      if (clientName.trim() === SYNC.SKIP_COMPANY_NAME) continue;
+
+      const deskCompanyId = notion.getRichText_(props[CLIENTS_DESK_COMPANY_ID_PROP]).trim();
+      if (!deskCompanyId) continue;
+
+      processed++;
+      console.log(`\n--- Client: ${clientName} | Desk Company ID: ${deskCompanyId} ---`);
+
+      // Load Notion related contacts for this client
+      const contactPageIds = notion.getRelationIds_(props[CLIENTS_CONTACTS_REL_PROP]);
+      const notionContacts = notion.fetchPages(contactPageIds);
+
+      // Build set of all emails already present in this client's Notion contacts
+      const notionEmailSet = new Set();
+      for (const c of notionContacts) {
+        const cp = c.properties || {};
+        const emails = uniqueEmails_([
+          notion.getEmail_(cp[CONTACT_EMAIL_PROP]),
+          notion.getEmail_(cp[CONTACT_EMAIL2_PROP]),
+          notion.getEmail_(cp[CONTACT_EMAIL3_PROP]),
+          notion.getEmail_(cp[CONTACT_EMAIL4_PROP]),
+        ]);
+        for (const e of emails) {
+          const em = normalizeEmail_(e);
+          if (em && validateEmail_(em) && !isExcluded_(em)) notionEmailSet.add(em);
+        }
+      }
+
+      /***************
+       * 1) Notion → Desk (create only if truly missing in Desk)
+       ***************/
+      for (const c of notionContacts) {
+        const cp = c.properties || {};
+        const contactName = notion.getTitleOrText_(cp[CONTACT_TITLE_PROP]) || "(No name)";
+        const nameParts = splitName_(contactName);
+
+        const emails = uniqueEmails_([
+          notion.getEmail_(cp[CONTACT_EMAIL_PROP]),
+          notion.getEmail_(cp[CONTACT_EMAIL2_PROP]),
+          notion.getEmail_(cp[CONTACT_EMAIL3_PROP]),
+          notion.getEmail_(cp[CONTACT_EMAIL4_PROP]),
+        ]);
+
+        for (const rawEmail of emails) {
+          const email = normalizeEmail_(rawEmail);
+
+          if (!email) continue;
+          if (!validateEmail_(email)) {
+            console.log(`Skip invalid Notion email: raw="${rawEmail}" normalized="${email}"`);
+            continue;
+          }
+          if (isExcluded_(email)) continue;
+
+          // Critical: search Desk by email INCLUDING contacts to catch secondary emails
+          if (desk.emailExistsAnywhere(email)) continue;
+
+          // Optional: if same person exists under this company, add email as secondary instead of creating duplicate
+          if (SYNC.TRY_SECONDARY_EMAIL_UPDATE) {
+            const match = desk.findCustomerByNameAndCompany(nameParts.firstName, nameParts.lastName, Number(deskCompanyId));
+            if (match && match.id) {
+              console.log(`Found Desk customer by name+company. Try add secondary: ${email} → customerId=${match.id}`);
+              if (!SYNC.DRY_RUN) {
+                const ok = desk.tryAddSecondaryEmail(match.id, email);
+                if (!ok) console.log(`NEEDS REVIEW: Desk rejected secondary email add for customerId=${match.id}. Not creating duplicate.`);
+              }
+              continue;
+            }
+          }
+
+          console.log(`Create Desk customer (new) ${email} → company ${deskCompanyId}`);
+          if (!SYNC.DRY_RUN) {
+            desk.createCustomer(email, nameParts.firstName, nameParts.lastName, Number(deskCompanyId));
+          }
+          Utilities.sleep(SYNC.SLEEP_MS);
+        }
+      }
+
+      /***************
+       * 2) Desk → Notion (add missing Desk contacts into Notion safely)
+       ***************/
+      if (SYNC.IMPORT_DESK_TO_NOTION) {
+        // Use Desk search filtered by companies[] (supported) and includes=contacts (supported)
+        const companyCustomers = desk.getCompanyCustomers(Number(deskCompanyId));
+
+        for (const dc of companyCustomers) {
+          const email = normalizeEmail_(dc.email);
+          if (!email) continue;
+          if (!validateEmail_(email)) continue;
+          if (isExcluded_(email)) continue;
+
+          if (notionEmailSet.has(email)) continue;
+
+          // If email exists anywhere in Notion Contacts DB, just relate it to this client
+          const existingByEmail = notion.findContactByAnyEmail(email);
+          if (existingByEmail) {
+            console.log(`Relate existing Notion contact by email: ${email} → ${clientName}`);
+            if (!SYNC.DRY_RUN) notion.addContactToClientRelation(clientPageId, existingByEmail.id);
+            notionEmailSet.add(email);
+            continue;
+          }
+
+          // Try match by name within this client's related contacts
+          const matches = findClientContactMatchesByName_(notion, notionContacts, dc.firstName, dc.lastName);
+
+          if (matches.length === 1) {
+            const matchPage = matches[0];
+            console.log(`Name-match found. Fill next empty email slot: ${email}`);
+
+            if (!SYNC.DRY_RUN) {
+              const didSet = notion.fillNextEmailSlot(matchPage.id, matchPage.properties, email);
+              if (!didSet) {
+                console.log(`No empty email slots; creating new contact: ${email}`);
+                const title = buildName_(dc.firstName, dc.lastName, email) || email;
+                const newId = notion.createContact(title, email);
+                notion.addContactToClientRelation(clientPageId, newId);
+              }
+            }
+
+            notionEmailSet.add(email);
+            Utilities.sleep(SYNC.SLEEP_MS);
+            continue;
+          }
+
+          // 0 or >1 matches: create new contact to avoid wrong merges
+          const title = buildName_(dc.firstName, dc.lastName, email) || email;
+          console.log(`Create Notion contact (new) from Desk: ${email} (${title})`);
+          if (!SYNC.DRY_RUN) {
+            const newId = notion.createContact(title, email);
+            notion.addContactToClientRelation(clientPageId, newId);
+          }
+          notionEmailSet.add(email);
+
+          Utilities.sleep(SYNC.SLEEP_MS);
+        }
+      }
+    }
+
+    if (!res.has_more) break;
+    cursor = res.next_cursor;
+  }
+
+  console.log("\n=== Nightly Contact Sync done ===");
+}
+
+/* ================= Desk Client ================= */
+
+function deskClient_() {
+  const site = getProp_("TEAMWORK_SITE"); // stringmarketing.teamwork.com
+  const apiKey = getProp_("TEAMWORK_DESK_API_KEY");
+  const base = `https://${site}/desk/api/v2`;
+  const headers = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
+
+  function searchCustomers_(search, page, companiesId) {
+    const params = [];
+    params.push(`search=${encodeURIComponent(search || "")}`);
+    params.push(`includes=${encodeURIComponent("companies,contacts")}`); // allowed includes :contentReference[oaicite:3]{index=3}
+    params.push(`pageSize=${SYNC.DESK_PAGE_SIZE}`);
+    params.push(`page=${page || 1}`);
+    if (companiesId) params.push(`companies[]=${encodeURIComponent(String(companiesId))}`); // supported :contentReference[oaicite:4]{index=4}
+    const url = `${base}/search/customers.json?${params.join("&")}`;
+    return fetchJson_(url, "get", headers, null, SYNC.FETCH_RETRIES, SYNC.FETCH_BACKOFF_MS);
+  }
+
+  function extractIncludedContacts_(res) {
+    const included = res.included || {};
+    // docs say included is used for relationships; keys vary in casing, so be defensive :contentReference[oaicite:5]{index=5}
+    return included.contacts || included.Contacts || [];
+  }
+
+  function emailInCustomerOrIncluded_(email, customers, includedContacts) {
+    const target = normalizeEmail_(email);
+
+    for (const c of (customers || [])) {
+      if (normalizeEmail_(c.email) === target) return true;
+    }
+
+    for (const ct of (includedContacts || [])) {
+      // We don't rely on exact schema name; check common ones
+      const v = normalizeEmail_(ct.value || ct.email || ct.address || "");
+      if (v === target) return true;
+    }
+
+    return false;
+  }
+
+  return {
+    emailExistsAnywhere: (email) => {
+      email = normalizeEmail_(email);
+      if (!validateEmail_(email) || isExcluded_(email)) return true; // treat excluded as "exists" so we never create it
+
+      const res = searchCustomers_(email, 1, null);
+      const customers = res.customers || [];
+      const includedContacts = extractIncludedContacts_(res);
+
+      return emailInCustomerOrIncluded_(email, customers, includedContacts);
+    },
+
+    getCompanyCustomers: (companyId) => {
+      const out = [];
+      let page = 1;
+
+      while (true) {
+        const res = searchCustomers_("", page, companyId);
+        const customers = res.customers || [];
+        out.push(...customers);
+
+        if (customers.length < SYNC.DESK_PAGE_SIZE) break;
+        page++;
+        Utilities.sleep(120);
+      }
+
+      return out;
+    },
+
+    findCustomerByNameAndCompany: (firstName, lastName, companyId) => {
+      const tf = (firstName || "").trim().toLowerCase();
+      const tl = (lastName || "").trim().toLowerCase();
+      if (!tf && !tl) return null;
+
+      const needle = tl || tf;
+      const res = searchCustomers_(needle, 1, companyId);
+      const customers = res.customers || [];
+
+      for (const c of customers) {
+        const fn = (c.firstName || "").trim().toLowerCase();
+        const ln = (c.lastName || "").trim().toLowerCase();
+
+        if (SYNC.REQUIRE_EXACT_NAME_MATCH) {
+          if (fn === tf && ln === tl) return c;
+        } else {
+          const full = `${fn} ${ln}`.trim();
+          if ((tf && full.includes(tf)) && (tl && full.includes(tl))) return c;
+        }
+      }
+      return null;
+    },
+
+    tryAddSecondaryEmail: (customerId, newEmail) => {
+      newEmail = normalizeEmail_(newEmail);
+      if (!validateEmail_(newEmail) || isExcluded_(newEmail)) return true;
+
+      const url = `${base}/customers/${encodeURIComponent(String(customerId))}.json`;
+
+      // Relationship-style contacts array (create schema shows customer.contacts exists) :contentReference[oaicite:6]{index=6}
+      const body = {
+        customer: {
+          contacts: [
+            {
+              // Desk relationship items accept delete/id/meta/type; here we're adding a new contact method
+              // Common Desk contact method fields are `type` and `value`; keep it simple.
+              type: "email",
+              value: newEmail,
+              main: false
+            }
+          ]
+        }
+      };
+
+      try {
+        fetchJson_(url, "patch", headers, body, SYNC.FETCH_RETRIES, SYNC.FETCH_BACKOFF_MS);
+        return true;
+      } catch (e) {
+        console.log(`Secondary-email update failed customerId=${customerId} email=${newEmail}. ${String(e)}`);
+        return false;
+      }
+    },
+
+    createCustomer: (email, firstName, lastName, companyId) => {
+      email = normalizeEmail_(email);
+      if (!validateEmail_(email) || isExcluded_(email)) throw new Error(`Refusing createCustomer email: "${email}"`);
+
+      const url = `${base}/customers.json`;
+
+      // Customer create schema includes customer.contacts array :contentReference[oaicite:7]{index=7}
+      // Also set customer.email since docs define it as the address used for replies :contentReference[oaicite:8]{index=8}
+      const body = {
+        customer: {
+          firstName: firstName || "",
+          lastName: lastName || "",
+          company: { id: Number(companyId) },
+          email: email,
+          contacts: [
+            { type: "email", value: email, main: true }
+          ]
+        }
+      };
+
+      const res = fetchJson_(url, "post", headers, body, SYNC.FETCH_RETRIES, SYNC.FETCH_BACKOFF_MS);
+      if (!res.customer || !res.customer.id) throw new Error("Desk createCustomer failed: missing customer.id");
+      return res.customer.id;
+    }
+  };
+}
+
+/* ================= Notion Client ================= */
+
+function notionClient_() {
+  const token = getProp_("NOTION_TOKEN");
+  const contactsDbId = getProp_("NOTION_CONTACTS_DB_ID");
+
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "Notion-Version": NOTION_VERSION,
+    "Content-Type": "application/json"
+  };
+
+  return {
+    dbQuery: (dbId, body) => fetchJson_(`https://api.notion.com/v1/databases/${dbId}/query`, "post", headers, body),
+
+    fetchPages: (pageIds) => {
+      const pages = [];
+      for (const id of (pageIds || [])) {
+        pages.push(fetchJson_(`https://api.notion.com/v1/pages/${id}`, "get", headers, null, 3, 600));
+        Utilities.sleep(120);
+      }
+      return pages;
+    },
+
+    findContactByAnyEmail: (email) => {
+      const checks = [CONTACT_EMAIL_PROP, CONTACT_EMAIL2_PROP, CONTACT_EMAIL3_PROP, CONTACT_EMAIL4_PROP];
+      for (const propName of checks) {
+        const res = fetchJson_(`https://api.notion.com/v1/databases/${contactsDbId}/query`, "post", headers, {
+          page_size: 1,
+          filter: { property: propName, email: { equals: email } }
+        }, 3, 600);
+        if (res.results && res.results.length) return res.results[0];
+      }
+      return null;
+    },
+
+    createContact: (contactName, email) => {
+      const res = fetchJson_(`https://api.notion.com/v1/pages`, "post", headers, {
+        parent: { database_id: contactsDbId },
+        properties: {
+          [CONTACT_TITLE_PROP]: { title: [{ type: "text", text: { content: contactName } }] },
+          [CONTACT_EMAIL_PROP]: { email }
+        }
+      }, 3, 600);
+      return res.id;
+    },
+
+    addContactToClientRelation: (clientPageId, contactPageId) => {
+      const client = fetchJson_(`https://api.notion.com/v1/pages/${clientPageId}`, "get", headers, null, 3, 600);
+      const rel = (client.properties &&
+        client.properties[CLIENTS_CONTACTS_REL_PROP] &&
+        client.properties[CLIENTS_CONTACTS_REL_PROP].relation) || [];
+      const ids = rel.map(r => r.id);
+      if (ids.includes(contactPageId)) return;
+
+      const newRel = ids.concat([contactPageId]).map(id => ({ id }));
+      fetchJson_(`https://api.notion.com/v1/pages/${clientPageId}`, "patch", headers, {
+        properties: { [CLIENTS_CONTACTS_REL_PROP]: { relation: newRel } }
+      }, 3, 600);
+    },
+
+    // Never overwrites Contact Name; only fills empty email slots
+    fillNextEmailSlot: (contactPageId, properties, email) => {
+      email = normalizeEmail_(email);
+      if (!validateEmail_(email) || isExcluded_(email)) return true;
+
+      const current = {
+        e1: normalizeEmail_(properties[CONTACT_EMAIL_PROP]?.email || ""),
+        e2: normalizeEmail_(properties[CONTACT_EMAIL2_PROP]?.email || ""),
+        e3: normalizeEmail_(properties[CONTACT_EMAIL3_PROP]?.email || ""),
+        e4: normalizeEmail_(properties[CONTACT_EMAIL4_PROP]?.email || ""),
+      };
+
+      if ([current.e1, current.e2, current.e3, current.e4].includes(email)) return true;
+
+      const updates = {};
+      if (!current.e1) updates[CONTACT_EMAIL_PROP] = { email };
+      else if (!current.e2) updates[CONTACT_EMAIL2_PROP] = { email };
+      else if (!current.e3) updates[CONTACT_EMAIL3_PROP] = { email };
+      else if (!current.e4) updates[CONTACT_EMAIL4_PROP] = { email };
+      else return false;
+
+      fetchJson_(`https://api.notion.com/v1/pages/${contactPageId}`, "patch", headers, { properties: updates }, 3, 600);
+      return true;
+    },
+
+    // Read helpers
+    getClientTitle_: (properties) => {
+      const p = properties[CLIENTS_TITLE_PROP];
+      if (p && p.type === "title") return (p.title || []).map(t => t.plain_text || "").join("");
+      for (const k in properties) {
+        if (properties[k] && properties[k].type === "title") {
+          return (properties[k].title || []).map(t => t.plain_text || "").join("");
+        }
+      }
+      return "";
+    },
+
+    getTitleOrText_: (prop) => {
+      if (!prop) return "";
+      if (prop.type === "title") return (prop.title || []).map(t => t.plain_text || "").join("");
+      if (prop.type === "rich_text") return (prop.rich_text || []).map(t => t.plain_text || "").join("");
+      return "";
+    },
+
+    getRichText_: (prop) => prop && prop.type === "rich_text" ? (prop.rich_text || []).map(t => t.plain_text || "").join("") : "",
+    getEmail_: (prop) => prop && prop.type === "email" ? (prop.email || "").trim() : "",
+    getRelationIds_: (prop) => prop && prop.type === "relation" ? (prop.relation || []).map(r => r.id) : []
+  };
+}
+
+/* ================= Matching Helpers ================= */
+
+function findClientContactMatchesByName_(notion, notionContacts, firstName, lastName) {
+  const tf = (firstName || "").trim().toLowerCase();
+  const tl = (lastName || "").trim().toLowerCase();
+  if (!tf && !tl) return [];
+
+  const matches = [];
+  for (const c of (notionContacts || [])) {
+    const cp = c.properties || {};
+    const title = notion.getTitleOrText_(cp[CONTACT_TITLE_PROP]) || "";
+    const nm = splitName_(title);
+
+    const fn = (nm.firstName || "").trim().toLowerCase();
+    const ln = (nm.lastName || "").trim().toLowerCase();
+
+    if (SYNC.REQUIRE_EXACT_NAME_MATCH) {
+      if (fn === tf && ln === tl) matches.push(c);
+    } else {
+      const full = `${fn} ${ln}`.trim();
+      if ((tf && full.includes(tf)) && (tl && full.includes(tl))) matches.push(c);
+    }
+  }
+  return matches;
+}
+
+/* ================= Email Rules ================= */
+
+function normalizeEmail_(email) {
+  if (!email) return "";
+  return String(email)
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\u00A0/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function validateEmail_(email) {
+  if (!email) return false;
+  if (email.length > 254) return false;
+  if (/[,\s;]/.test(email)) return false;
+  const re = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+  if (!re.test(email)) return false;
+  const parts = email.split("@");
+  if (parts.length !== 2) return false;
+  if (parts[1].includes("..")) return false;
+  return true;
+}
+
+function isExcluded_(email) {
+  const e = normalizeEmail_(email);
+  if (!e) return true;
+
+  for (const bad of SYNC.EXCLUDE_CONTAINS) {
+    if (e.includes(bad)) return true;
+  }
+
+  if (SYNC.SKIP_STRINGMARKETING_SUBDOMAINS) {
+    const domain = e.split("@")[1] || "";
+    if (domain.endsWith(".stringmarketing.com") && domain !== "stringmarketing.com") return true;
+  }
+
+  return false;
+}
+
+function uniqueEmails_(arr) {
+  const out = [];
+  const seen = new Set();
+  for (const e of (arr || [])) {
+    const v = normalizeEmail_(e);
+    if (!v) continue;
+    if (seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+  }
+  return out;
+}
+
+/* ================= Generic Utils ================= */
+
+function splitName_(fullName) {
+  const s = (fullName || "").trim();
+  if (!s) return { firstName: "", lastName: "" };
+  const parts = s.split(/\s+/);
+  if (parts.length === 1) return { firstName: parts[0], lastName: "" };
+  return { firstName: parts[0], lastName: parts.slice(1).join(" ") };
+}
+
+function buildName_(firstName, lastName, fallback) {
+  const n = `${(firstName || "").trim()} ${(lastName || "").trim()}`.trim();
+  return n || fallback;
+}
+
+function getProp_(name) {
+  const v = PropertiesService.getScriptProperties().getProperty(name);
+  if (!v) throw new Error(`Missing Script Property: ${name}`);
+  return v;
+}
+
+function fetchJson_(url, method, headers, body, retries, backoffMs) {
+  const maxTries = 1 + (retries || 0);
+  const baseBackoff = backoffMs || 500;
+
+  for (let attempt = 1; attempt <= maxTries; attempt++) {
+    const opts = { method, headers, muteHttpExceptions: true };
+    if (body) opts.payload = JSON.stringify(body);
+
+    const res = UrlFetchApp.fetch(url, opts);
+    const code = res.getResponseCode();
+    const text = res.getContentText();
+
+    if (code >= 200 && code < 300) {
+      if (!text) return {};
+      try { return JSON.parse(text); } catch (e) { return {}; }
+    }
+
+    const retryable = (code === 429 || (code >= 500 && code <= 599));
+    const msg = `HTTP ${code} ${method.toUpperCase()} ${url} :: ${text}`;
+
+    if (!retryable || attempt === maxTries) throw new Error(msg);
+
+    const sleepFor = baseBackoff * Math.pow(2, attempt - 1);
+    console.log(`Retryable error. Attempt ${attempt}/${maxTries}: ${msg} | sleeping ${sleepFor}ms`);
+    Utilities.sleep(sleepFor);
+  }
+
+  throw new Error(`Unknown fetch failure for ${url}`);
+}
