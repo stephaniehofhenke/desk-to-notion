@@ -59,6 +59,17 @@ function nightlyContactsSync_apply() {
   nightlyContactsSync_();
 }
 
+// One-time cleanup that backfills Desk Contact IDs on existing Notion contacts.
+function cleanupContactsSync_dryRun() {
+  SYNC.DRY_RUN = true;
+  cleanupContactsSync_();
+}
+
+function cleanupContactsSync_apply() {
+  SYNC.DRY_RUN = false;
+  cleanupContactsSync_();
+}
+
 function nightlyContactsSync_() {
   const notion = notionClient_();
   const desk = deskClient_();
@@ -259,6 +270,83 @@ function nightlyContactsSync_() {
   console.log("\n=== Nightly Contact Sync done ===");
 }
 
+function cleanupContactsSync_() {
+  const notion = notionClient_();
+  const desk = deskClient_();
+
+  const contactsDbId = notion.getContactsDbId();
+  let cursor = null;
+  let processed = 0;
+  let updated = 0;
+
+  console.log(`=== Cleanup Contact Sync start === DRY_RUN=${SYNC.DRY_RUN}`);
+
+  while (true) {
+    const query = { page_size: 100 };
+    if (cursor) query.start_cursor = cursor;
+
+    const res = notion.dbQuery(contactsDbId, query);
+    const pages = res.results || [];
+
+    for (const page of pages) {
+      processed++;
+      const props = page.properties || {};
+      const existingDeskId = notion.getDeskContactId_(props[CONTACT_DESK_ID_PROP]);
+      const contactTitle = notion.getTitleOrText_(props[CONTACT_TITLE_PROP]) || "(Untitled)";
+
+      if (existingDeskId !== null && existingDeskId !== undefined) {
+        continue;
+      }
+
+      const emails = uniqueEmails_([
+        notion.getEmail_(props[CONTACT_EMAIL_PROP]),
+        notion.getEmail_(props[CONTACT_EMAIL2_PROP]),
+        notion.getEmail_(props[CONTACT_EMAIL3_PROP]),
+        notion.getEmail_(props[CONTACT_EMAIL4_PROP]),
+      ]);
+
+      if (!emails.length) continue;
+
+      const matchedIds = [];
+
+      for (const rawEmail of emails) {
+        const email = normalizeEmail_(rawEmail);
+        if (!validateEmail_(email) || isExcluded_(email)) continue;
+
+        const match = desk.findCustomerIdByEmail(email);
+        if (!match) continue;
+        if (match.conflict) {
+          console.log(`Skip Desk Contact ID set due to multiple Desk matches for ${email}: ids=${(match.ids || []).join(",")}`);
+          matchedIds.length = 0;
+          break;
+        }
+
+        matchedIds.push(match.id);
+      }
+
+      const uniqueIds = Array.from(new Set(matchedIds.filter(Boolean)));
+      if (!uniqueIds.length) continue;
+      if (uniqueIds.length > 1) {
+        console.log(`Skip Desk Contact ID set due to conflicting Desk IDs ${uniqueIds.join(",")} for contactId=${page.id}`);
+        continue;
+      }
+
+      const deskId = uniqueIds[0];
+      const result = notion.setContactDeskIdIfEmpty(page.id, props, deskId);
+      if (result && result.updated) {
+        updated++;
+      }
+
+      console.log(`Backfill Desk Contact ID=${deskId} on contact "${contactTitle}" (contactId=${page.id})`);
+    }
+
+    if (!res.has_more) break;
+    cursor = res.next_cursor;
+  }
+
+  console.log(`=== Cleanup Contact Sync done. Processed=${processed} Updated=${updated} DRY_RUN=${SYNC.DRY_RUN} ===`);
+}
+
 /* ================= Desk Client ================= */
 
 function deskClient_() {
@@ -350,6 +438,37 @@ function deskClient_() {
         }
       }
       return null;
+    },
+
+    findCustomerIdByEmail: (email) => {
+      email = normalizeEmail_(email);
+      if (!validateEmail_(email) || isExcluded_(email)) return null;
+
+      const res = searchCustomers_(email, 1, null);
+      const customers = res.customers || [];
+      const includedContacts = extractIncludedContacts_(res);
+
+      const ids = new Set();
+
+      for (const c of customers) {
+        if (normalizeEmail_(c.email) === email) ids.add(c.id);
+      }
+
+      for (const ct of includedContacts) {
+        const v = normalizeEmail_(ct.value || ct.email || ct.address || "");
+        if (v !== email) continue;
+
+        // If included contact is linked to a customer, prefer that id. Some Desk responses
+        // surface relationship via customerId or customer_id; be defensive.
+        const linkedCustomerId = ct.customerId || ct.customer_id || (ct.relationships && ct.relationships.customer && ct.relationships.customer.id);
+        if (linkedCustomerId) ids.add(linkedCustomerId);
+      }
+
+      const idList = Array.from(ids);
+      if (!idList.length) return null;
+      if (idList.length > 1) return { conflict: true, ids: idList };
+
+      return { id: idList[0] };
     },
 
     tryAddSecondaryEmail: (customerId, newEmail) => {
@@ -475,6 +594,8 @@ function notionClient_() {
 
   return {
     dbQuery: (dbId, body) => fetchJson_(`https://api.notion.com/v1/databases/${dbId}/query`, "post", headers, body),
+
+    getContactsDbId: () => contactsDbId,
 
     fetchPages: (pageIds) => {
       const pages = [];
