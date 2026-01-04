@@ -159,14 +159,45 @@ function NotionClient_(cfg) {
     Authorization: "Bearer " + cfg.NOTION_TOKEN,
     "Notion-Version": NOTION_VERSION
   });
+  var dataSourceIdCache_ = {};
   var normalizeDbId_ = function (dbId) {
     var cleaned = String(dbId || "").trim();
     if (!cleaned) throw new Error("Missing Notion database ID");
     return cleaned;
   };
+  function resolveDataSourceId_(dbOrDataSourceId) {
+    var cleanDbId = normalizeDbId_(dbOrDataSourceId);
+    if (dataSourceIdCache_[cleanDbId]) return dataSourceIdCache_[cleanDbId];
+    var resp = fetchWithBackoff_("https://api.notion.com/v1/databases/" + cleanDbId, {
+      method: "get",
+      headers: headers,
+      muteHttpExceptions: true
+    }, 3, 800);
+    var json;
+    if (resp && typeof resp.getResponseCode === "function") {
+      var code = resp.getResponseCode();
+      var text = resp.getContentText();
+      if (code < 200 || code >= 300) {
+        throw new Error("HTTP " + code + " GET database " + cleanDbId + " :: " + text);
+      }
+      json = text ? JSON.parse(text) : {};
+    } else {
+      json = resp || {};
+      if ((json.status && json.status >= 400) || (json.code && json.code >= 400)) {
+        throw new Error("Notion database lookup failed: " + JSON.stringify(json));
+      }
+    }
+    if (!json || !json.data_sources || !json.data_sources.length || !json.data_sources[0].id) {
+      throw new Error("No data_sources found for database " + cleanDbId);
+    }
+    var dsId = json.data_sources[0].id;
+    dataSourceIdCache_[cleanDbId] = dsId;
+    return dsId;
+  }
 
   function queryByNumber_(dbId, property, numberValue) {
     var cleanDbId = normalizeDbId_(dbId);
+    var dsId = resolveDataSourceId_(cleanDbId);
     var body = {
       page_size: 1,
       filter: {
@@ -174,7 +205,7 @@ function NotionClient_(cfg) {
         number: { equals: Number(numberValue) }
       }
     };
-    return fetchWithBackoff_("https://api.notion.com/v1/data_sources/" + cleanDbId + "/query", {
+    return fetchWithBackoff_("https://api.notion.com/v1/data_sources/" + dsId + "/query", {
       method: "post",
       headers: headers,
       payload: JSON.stringify(body),
@@ -184,6 +215,7 @@ function NotionClient_(cfg) {
 
   function queryBySelect_(dbId, property, value) {
     var cleanDbId = normalizeDbId_(dbId);
+    var dsId = resolveDataSourceId_(cleanDbId);
     var body = {
       page_size: 1,
       filter: {
@@ -191,7 +223,7 @@ function NotionClient_(cfg) {
         select: { equals: value }
       }
     };
-    return fetchWithBackoff_("https://api.notion.com/v1/data_sources/" + cleanDbId + "/query", {
+    return fetchWithBackoff_("https://api.notion.com/v1/data_sources/" + dsId + "/query", {
       method: "post",
       headers: headers,
       payload: JSON.stringify(body),
@@ -201,10 +233,11 @@ function NotionClient_(cfg) {
 
   function createPage_(dbId, properties) {
     var cleanDbId = normalizeDbId_(dbId);
+    var dsId = resolveDataSourceId_(cleanDbId);
     return fetchWithBackoff_("https://api.notion.com/v1/pages", {
       method: "post",
       headers: headers,
-      payload: JSON.stringify({ parent: { data_source_id: cleanDbId }, properties: properties }),
+      payload: JSON.stringify({ parent: { data_source_id: dsId }, properties: properties }),
       muteHttpExceptions: true
     }, 3, 800);
   }
@@ -232,7 +265,8 @@ function NotionClient_(cfg) {
     queryBySelect: queryBySelect_,
     createPage: createPage_,
     updatePage: updatePage_,
-    archivePage: archivePage_
+    archivePage: archivePage_,
+    getDataSourceId: resolveDataSourceId_
   };
 }
 
@@ -322,6 +356,11 @@ function SyncEngine_(cfg, desk, notion) {
 
   function resolveContact_(ticket) {
     var contact = ticket.customer || ticket.contact || {};
+    var contactDataSourceId = notion.getDataSourceId(cfg.NOTION_CONTACTS_DB_ID);
+    var contactHeaders = buildHeaders_({
+      Authorization: "Bearer " + cfg.NOTION_TOKEN,
+      "Notion-Version": NOTION_VERSION
+    });
     if (contact.id) {
       var byId = notion.queryByNumber(cfg.NOTION_CONTACTS_DB_ID, "Desk Contact ID", contact.id);
       if (byId.results && byId.results.length) return byId.results[0].id;
@@ -343,12 +382,9 @@ function SyncEngine_(cfg, desk, notion) {
       var email = emailKeys[i];
       var checks = ["Email", "Secondary Email", "Email 3", "Email 4"];
       for (var j = 0; j < checks.length; j++) {
-        var res = fetchWithBackoff_("https://api.notion.com/v1/data_sources/" + cfg.NOTION_CONTACTS_DB_ID + "/query", {
+        var res = fetchWithBackoff_("https://api.notion.com/v1/data_sources/" + contactDataSourceId + "/query", {
           method: "post",
-          headers: buildHeaders_({
-            Authorization: "Bearer " + cfg.NOTION_TOKEN,
-            "Notion-Version": NOTION_VERSION
-          }),
+          headers: contactHeaders,
           payload: JSON.stringify({
             page_size: 1,
             filter: { property: checks[j], email: { equals: email } }
@@ -360,12 +396,9 @@ function SyncEngine_(cfg, desk, notion) {
     }
 
     if (contact.name) {
-      var resName = fetchWithBackoff_("https://api.notion.com/v1/data_sources/" + cfg.NOTION_CONTACTS_DB_ID + "/query", {
+      var resName = fetchWithBackoff_("https://api.notion.com/v1/data_sources/" + contactDataSourceId + "/query", {
         method: "post",
-        headers: buildHeaders_({
-          Authorization: "Bearer " + cfg.NOTION_TOKEN,
-          "Notion-Version": NOTION_VERSION
-        }),
+        headers: contactHeaders,
         payload: JSON.stringify({
           page_size: 1,
           filter: { property: "Contact Name", title: { equals: contact.name } }
@@ -569,6 +602,15 @@ function SyncEngine_(cfg, desk, notion) {
     pollChanges: pollChanges_,
     backfillLastNDays: backfillLastNDays_
   };
+}
+
+function testNotionDataSourceResolution_() {
+  var cfg = getConfig_();
+  var notion = NotionClient_(cfg);
+  var dsId = notion.getDataSourceId(cfg.NOTION_DB_TICKETS);
+  var res = notion.queryBySelect(cfg.NOTION_DB_TICKETS, "Status", "Open");
+  var count = (res && res.results && res.results.length) ? res.results.length : 0;
+  Logger.log(JSON.stringify({ level: "info", message: "Notion data source resolution test", dataSourceId: dsId, results: count }));
 }
 
 /* ============================= Endpoints ============================= */
