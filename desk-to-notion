@@ -26,6 +26,7 @@ const CONTACT_EMAIL_PROP = "Email";
 const CONTACT_EMAIL2_PROP = "Secondary Email";
 const CONTACT_EMAIL3_PROP = "Email 3";
 const CONTACT_EMAIL4_PROP = "Email 4";
+const CONTACT_DESK_ID_PROP = "Desk Contact ID";
 
 // ===== Settings =====
 const SYNC = {
@@ -145,7 +146,13 @@ function nightlyContactsSync_() {
           if (SYNC.TRY_SECONDARY_EMAIL_UPDATE) {
             const match = desk.findCustomerByNameAndCompany(nameParts.firstName, nameParts.lastName, Number(deskCompanyId));
             if (match && match.id) {
-              console.log(`Found Desk customer by name+company. Try add secondary: ${email} → customerId=${match.id}`);
+              const deskIdResult = notion.setContactDeskIdIfEmpty(c.id, cp, match.id);
+              if (deskIdResult && deskIdResult.conflict) {
+                console.log(`Skip secondary-email add due to Desk Contact ID conflict (existing=${deskIdResult.existing}, new=${match.id}) contactId=${c.id}`);
+                continue;
+              }
+
+              console.log(`Found Desk customer by name+company. Try add secondary: ${email} → customerId=${match.id} | deskId=${match.id}`);
               if (!SYNC.DRY_RUN) {
                 const ok = desk.tryAddSecondaryEmail(match.id, email);
                 if (!ok) console.log(`NEEDS REVIEW: Desk rejected secondary email add for customerId=${match.id}. Not creating duplicate.`);
@@ -154,9 +161,19 @@ function nightlyContactsSync_() {
             }
           }
 
-          console.log(`Create Desk customer (new) ${email} → company ${deskCompanyId}`);
-          if (!SYNC.DRY_RUN) {
-            desk.createCustomer(email, nameParts.firstName, nameParts.lastName, Number(deskCompanyId));
+          const existingDeskId = notion.getDeskContactId_(cp[CONTACT_DESK_ID_PROP]);
+          if (existingDeskId !== null && existingDeskId !== undefined) {
+            console.log(`Skip Desk customer create; contact already has Desk Contact ID=${existingDeskId}. contactId=${c.id}`);
+            continue;
+          }
+
+          const createLog = `Create Desk customer (new) ${email} → company ${deskCompanyId}`;
+          if (SYNC.DRY_RUN) {
+            console.log(`${createLog} | DRY_RUN (deskId pending)`);
+          } else {
+            const newDeskId = desk.createCustomer(email, nameParts.firstName, nameParts.lastName, Number(deskCompanyId));
+            console.log(`${createLog} | deskId=${newDeskId}`);
+            notion.setContactDeskIdIfEmpty(c.id, cp, newDeskId);
           }
           Utilities.sleep(SYNC.SLEEP_MS);
         }
@@ -180,7 +197,14 @@ function nightlyContactsSync_() {
           // If email exists anywhere in Notion Contacts DB, just relate it to this client
           const existingByEmail = notion.findContactByAnyEmail(email);
           if (existingByEmail) {
-            console.log(`Relate existing Notion contact by email: ${email} → ${clientName}`);
+            const existingProps = existingByEmail.properties || {};
+            const deskIdResult = notion.setContactDeskIdIfEmpty(existingByEmail.id, existingProps, dc.id);
+            if (deskIdResult && deskIdResult.conflict) {
+              console.log(`Skip relating contactId=${existingByEmail.id} due to Desk Contact ID conflict (existing=${deskIdResult.existing}, new=${dc.id})`);
+              continue;
+            }
+
+            console.log(`Relate existing Notion contact by email: ${email} → ${clientName} | deskId=${dc.id}`);
             if (!SYNC.DRY_RUN) notion.addContactToClientRelation(clientPageId, existingByEmail.id);
             notionEmailSet.add(email);
             continue;
@@ -191,14 +215,20 @@ function nightlyContactsSync_() {
 
           if (matches.length === 1) {
             const matchPage = matches[0];
-            console.log(`Name-match found. Fill next empty email slot: ${email}`);
+            const deskIdResult = notion.setContactDeskIdIfEmpty(matchPage.id, matchPage.properties, dc.id);
+            if (deskIdResult && deskIdResult.conflict) {
+              console.log(`Desk Contact ID mismatch on contactId=${matchPage.id}. existing=${deskIdResult.existing} new=${dc.id}. Skipping email write.`);
+              continue;
+            }
+
+            console.log(`Name-match found. Fill next empty email slot: ${email} | deskId=${dc.id}`);
 
             if (!SYNC.DRY_RUN) {
               const didSet = notion.fillNextEmailSlot(matchPage.id, matchPage.properties, email);
               if (!didSet) {
-                console.log(`No empty email slots; creating new contact: ${email}`);
+                console.log(`No empty email slots; creating new contact: ${email} | deskId=${dc.id}`);
                 const title = buildName_(dc.firstName, dc.lastName, email) || email;
-                const newId = notion.createContact(title, email);
+                const newId = notion.createContact(title, email, dc.id);
                 notion.addContactToClientRelation(clientPageId, newId);
               }
             }
@@ -210,9 +240,9 @@ function nightlyContactsSync_() {
 
           // 0 or >1 matches: create new contact to avoid wrong merges
           const title = buildName_(dc.firstName, dc.lastName, email) || email;
-          console.log(`Create Notion contact (new) from Desk: ${email} (${title})`);
+          console.log(`Create Notion contact (new) from Desk: ${email} (${title}) | deskId=${dc.id}`);
           if (!SYNC.DRY_RUN) {
-            const newId = notion.createContact(title, email);
+            const newId = notion.createContact(title, email, dc.id);
             notion.addContactToClientRelation(clientPageId, newId);
           }
           notionEmailSet.add(email);
@@ -391,6 +421,58 @@ function notionClient_() {
     "Content-Type": "application/json"
   };
 
+  assertDeskIdPropertyExists_();
+
+  function assertDeskIdPropertyExists_() {
+    const db = fetchJson_(`https://api.notion.com/v1/databases/${contactsDbId}`, "get", headers, null, 3, 600);
+    const prop = db.properties && db.properties[CONTACT_DESK_ID_PROP];
+    if (!prop || prop.type !== "number") {
+      throw new Error(`Notion Contacts DB missing required number property "${CONTACT_DESK_ID_PROP}"`);
+    }
+  }
+
+  function normalizeDeskId_(deskId) {
+    if (deskId === null || deskId === undefined) return null;
+    const num = Number(deskId);
+    if (!Number.isFinite(num)) return null;
+    return num;
+  }
+
+  function ensureDeskIdProp_(properties) {
+    const prop = properties && properties[CONTACT_DESK_ID_PROP];
+    if (!prop || prop.type !== "number") {
+      throw new Error(`Missing Notion property "${CONTACT_DESK_ID_PROP}" on contact page`);
+    }
+    return prop;
+  }
+
+  function setDeskIdIfEmpty_(contactPageId, properties, deskId) {
+    const deskIdNum = normalizeDeskId_(deskId);
+    if (deskIdNum === null) return { updated: false, reason: "invalid" };
+
+    const prop = ensureDeskIdProp_(properties);
+    const existing = prop.number;
+
+    if (existing === deskIdNum) return { updated: false, reason: "same" };
+
+    if (existing !== null && existing !== undefined) {
+      console.log(`Desk Contact ID already set (${existing}) differs from ${deskIdNum}. contactId=${contactPageId}. Skipping update.`);
+      return { updated: false, conflict: true, existing };
+    }
+
+    console.log(`Set Desk Contact ID=${deskIdNum} → contactId=${contactPageId}`);
+    if (SYNC.DRY_RUN) {
+      prop.number = deskIdNum;
+      return { updated: false, reason: "dry_run" };
+    }
+
+    fetchJson_(`https://api.notion.com/v1/pages/${contactPageId}`, "patch", headers, {
+      properties: { [CONTACT_DESK_ID_PROP]: { number: deskIdNum } }
+    }, 3, 600);
+    prop.number = deskIdNum;
+    return { updated: true };
+  }
+
   return {
     dbQuery: (dbId, body) => fetchJson_(`https://api.notion.com/v1/databases/${dbId}/query`, "post", headers, body),
 
@@ -415,13 +497,19 @@ function notionClient_() {
       return null;
     },
 
-    createContact: (contactName, email) => {
+    createContact: (contactName, email, deskId) => {
+      const deskIdNum = normalizeDeskId_(deskId);
+
+      const properties = {
+        [CONTACT_TITLE_PROP]: { title: [{ type: "text", text: { content: contactName } }] },
+        [CONTACT_EMAIL_PROP]: { email }
+      };
+
+      if (deskIdNum !== null) properties[CONTACT_DESK_ID_PROP] = { number: deskIdNum };
+
       const res = fetchJson_(`https://api.notion.com/v1/pages`, "post", headers, {
         parent: { database_id: contactsDbId },
-        properties: {
-          [CONTACT_TITLE_PROP]: { title: [{ type: "text", text: { content: contactName } }] },
-          [CONTACT_EMAIL_PROP]: { email }
-        }
+        properties
       }, 3, 600);
       return res.id;
     },
@@ -465,6 +553,8 @@ function notionClient_() {
       return true;
     },
 
+    setContactDeskIdIfEmpty: (contactPageId, properties, deskId) => setDeskIdIfEmpty_(contactPageId, properties, deskId),
+
     // Read helpers
     getClientTitle_: (properties) => {
       const p = properties[CLIENTS_TITLE_PROP];
@@ -486,7 +576,8 @@ function notionClient_() {
 
     getRichText_: (prop) => prop && prop.type === "rich_text" ? (prop.rich_text || []).map(t => t.plain_text || "").join("") : "",
     getEmail_: (prop) => prop && prop.type === "email" ? (prop.email || "").trim() : "",
-    getRelationIds_: (prop) => prop && prop.type === "relation" ? (prop.relation || []).map(r => r.id) : []
+    getRelationIds_: (prop) => prop && prop.type === "relation" ? (prop.relation || []).map(r => r.id) : [],
+    getDeskContactId_: (prop) => prop && prop.type === "number" ? prop.number : null
   };
 }
 
