@@ -13,7 +13,7 @@
  * - GET /desk/api/v2/search/customers.json supports includes=contacts and companies[] filters
  *******************************************************/
 
-const NOTION_VERSION = "2022-06-28";
+const NOTION_VERSION = "2025-09-03";
 
 // ===== Clients DB =====
 const CLIENTS_TITLE_PROP = "Business Name";
