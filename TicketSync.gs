@@ -14,7 +14,7 @@
 function getConfig_() {
   const props = PropertiesService.getScriptProperties();
   const required = [
-    "TEAMWORK_SITE_BASE",
+    "TEAMWORK_SITE",
     "TEAMWORK_DESK_API_KEY",
     "NOTION_TOKEN",
     "NOTION_VERSION",
@@ -93,7 +93,7 @@ function buildHeaders_(extra) {
 /* ========================= Teamwork Desk Client ========================= */
 
 function TeamworkDeskClient_(cfg) {
-  var base = "https://" + cfg.TEAMWORK_SITE_BASE + "/desk/api/v2";
+  var base = "https://" + cfg.TEAMWORK_SITE + "/desk/api/v2";
   var headers = buildHeaders_({ Authorization: "Bearer " + cfg.TEAMWORK_DESK_API_KEY });
 
   function buildUrl_(path, params) {
