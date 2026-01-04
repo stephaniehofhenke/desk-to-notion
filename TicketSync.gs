@@ -294,6 +294,24 @@ function pickName_(v) {
   return "";
 }
 
+function buildTicketUrl_(ticket, cfg) {
+  // Prefer API-provided url if it is valid
+  var raw = ticket && ticket.url ? String(ticket.url).trim() : "";
+  if (raw && (raw.indexOf("http://") === 0 || raw.indexOf("https://") === 0)) return raw;
+
+  // Some Desk payloads may include a webUrl or link field
+  var webUrl = ticket && ticket.webUrl ? String(ticket.webUrl).trim() : "";
+  if (webUrl && (webUrl.indexOf("http://") === 0 || webUrl.indexOf("https://") === 0)) return webUrl;
+
+  // Fallback: construct a best-effort URL to the ticket in Teamwork Desk UI
+  // Use cfg.TEAMWORK_SITE (already exists) and ticket.id
+  var id = ticket && ticket.id ? String(ticket.id).trim() : "";
+  if (!id) return "";
+
+  // Use a safe default format. If your Desk UI uses a different path, we can adjust after logging.
+  return "https://" + cfg.TEAMWORK_SITE + "/desk/tickets/" + encodeURIComponent(id);
+}
+
 function mapDeskTicketToNotionProps_(ticket, related, cfg) {
   var props = {};
   var needsReview = false;
@@ -306,7 +324,8 @@ function mapDeskTicketToNotionProps_(ticket, related, cfg) {
   props["Status"] = statusName ? { select: { name: statusName } } : { select: null };
   props["Priority"] = priorityName ? { select: { name: priorityName } } : { select: null };
   props["Tags"] = { multi_select: (ticket.tags || []).map(function (t) { return { name: t }; }) };
-  props["Ticket Link"] = ticket.url ? { url: ticket.url } : { url: null };
+  var ticketLink = buildTicketUrl_(ticket, cfg);
+  props["Ticket Link"] = ticketLink ? { url: ticketLink } : { url: null };
   props["Date Created"] = ticket.createdAt ? { date: { start: ticket.createdAt } } : { date: null };
 
   if (related.clientId) {
@@ -491,6 +510,7 @@ function SyncEngine_(cfg, desk, notion) {
     };
 
     var properties = mapDeskTicketToNotionProps_(ticket, related, cfg);
+    Logger.log("Ticket Link mapped for ticket " + ticket.id + ": " + JSON.stringify(properties["Ticket Link"]));
     var existing = findTicketPage_(ticket.id);
 
     if (existing) {
