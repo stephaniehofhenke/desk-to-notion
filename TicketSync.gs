@@ -169,6 +169,7 @@ function NotionClient_(cfg) {
     "Notion-Version": NOTION_VERSION
   });
   var dataSourceIdCache_ = {};
+  var dbSchemaCache_ = {};
   var normalizeDbId_ = function (dbId) {
     var cleaned = String(dbId || "").trim();
     if (!cleaned) throw new Error("Missing Notion database ID");
@@ -202,6 +203,28 @@ function NotionClient_(cfg) {
     var dsId = json.data_sources[0].id;
     dataSourceIdCache_[cleanDbId] = dsId;
     return dsId;
+  }
+
+  function getDb_(dbId) {
+    var cleanDbId = normalizeDbId_(dbId);
+    if (dbSchemaCache_[cleanDbId]) return dbSchemaCache_[cleanDbId];
+    var db = fetchWithBackoff_("https://api.notion.com/v1/databases/" + cleanDbId, {
+      method: "get",
+      headers: headers,
+      muteHttpExceptions: true
+    }, 3, 800);
+    dbSchemaCache_[cleanDbId] = db;
+    return db;
+  }
+
+  function getDbProps_(dbId) {
+    var cleanDbId = normalizeDbId_(dbId);
+    if (dbSchemaCache_[cleanDbId] && dbSchemaCache_[cleanDbId].properties) {
+      return dbSchemaCache_[cleanDbId].properties;
+    }
+    var db = getDb_(cleanDbId);
+    dbSchemaCache_[cleanDbId] = db;
+    return (db && db.properties) || {};
   }
 
   function queryByNumber_(dbId, property, numberValue) {
@@ -260,6 +283,74 @@ function NotionClient_(cfg) {
     }, 3, 800);
   }
 
+  function ensureSelectOption_(dbId, propertyName, optionName) {
+    var cleanOption = (optionName || "").trim();
+    if (!cleanOption) return;
+
+    var cleanDbId = normalizeDbId_(dbId);
+    var props = getDbProps_(cleanDbId);
+    if (!props[propertyName] || props[propertyName].type !== "select") return;
+
+    var existingOptions = (props[propertyName].select && props[propertyName].select.options) || [];
+    var hasOption = existingOptions.some(function (opt) { return opt && opt.name === cleanOption; });
+    if (hasOption) return;
+
+    var payload = {
+      properties: {}
+    };
+    payload.properties[propertyName] = {
+      select: {
+        options: existingOptions.concat([{ name: cleanOption }])
+      }
+    };
+
+    fetchWithBackoff_("https://api.notion.com/v1/databases/" + cleanDbId, {
+      method: "patch",
+      headers: headers,
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    }, 3, 800);
+
+    dbSchemaCache_[cleanDbId] = null;
+    getDb_(cleanDbId);
+  }
+
+  function ensureMultiSelectOptions_(dbId, propertyName, optionNamesArray) {
+    var names = (optionNamesArray || []).map(function (n) { return String(n || "").trim(); }).filter(function (n) { return !!n; });
+    var dedup = {};
+    names.forEach(function (n) { dedup[n] = true; });
+    var uniqueNames = Object.keys(dedup);
+    if (!uniqueNames.length) return;
+
+    var cleanDbId = normalizeDbId_(dbId);
+    var props = getDbProps_(cleanDbId);
+    if (!props[propertyName] || props[propertyName].type !== "multi_select") return;
+
+    var existingOptions = (props[propertyName].multi_select && props[propertyName].multi_select.options) || [];
+    var existingNames = existingOptions.map(function (opt) { return opt && opt.name; });
+    var missing = uniqueNames.filter(function (n) { return existingNames.indexOf(n) === -1; });
+    if (!missing.length) return;
+
+    var payload = {
+      properties: {}
+    };
+    payload.properties[propertyName] = {
+      multi_select: {
+        options: existingOptions.concat(missing.map(function (n) { return { name: n }; }))
+      }
+    };
+
+    fetchWithBackoff_("https://api.notion.com/v1/databases/" + cleanDbId, {
+      method: "patch",
+      headers: headers,
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    }, 3, 800);
+
+    dbSchemaCache_[cleanDbId] = null;
+    getDb_(cleanDbId);
+  }
+
   function archivePage_(pageId) {
     return fetchWithBackoff_("https://api.notion.com/v1/pages/" + pageId, {
       method: "patch",
@@ -275,7 +366,9 @@ function NotionClient_(cfg) {
     createPage: createPage_,
     updatePage: updatePage_,
     archivePage: archivePage_,
-    getDataSourceId: resolveDataSourceId_
+    getDataSourceId: resolveDataSourceId_,
+    ensureSelectOption: ensureSelectOption_,
+    ensureMultiSelectOptions: ensureMultiSelectOptions_
   };
 }
 
@@ -457,9 +550,10 @@ function SyncEngine_(cfg, desk, notion) {
 
   function resolveAssignee_(ticket) {
     var assignee = ticket.assignee || ticket.assignedTo;
-    if (!assignee || !assignee.id) return null;
+    if (!assignee || assignee.id === undefined || assignee.id === null) return null;
     var res = notion.queryByNumber(cfg.NOTION_DB_TEAM_DIRECTORY, "Desk Agent ID", assignee.id);
     if (res.results && res.results.length) return res.results[0].id;
+    Logger.log("No assignee match in Team Directory for Desk Agent ID " + assignee.id);
     return null;
   }
 
@@ -510,8 +604,17 @@ function SyncEngine_(cfg, desk, notion) {
     };
 
     var properties = mapDeskTicketToNotionProps_(ticket, related, cfg);
-    Logger.log("Ticket Link mapped for ticket " + ticket.id + ": " + JSON.stringify(properties["Ticket Link"]));
+    Logger.log("Ticket " + ticket.id + " Ticket Link => " + JSON.stringify(properties["Ticket Link"]));
+
+    var statusProp = properties["Status"];
+    var statusNameMapped = statusProp && statusProp.select ? statusProp.select.name : "";
+    notion.ensureSelectOption(cfg.NOTION_DB_TICKETS, "Status", statusNameMapped);
+
+    var tagNames = (ticket.tags || []).map(function (t) { return String(t || "").trim(); });
+    notion.ensureMultiSelectOptions(cfg.NOTION_DB_TICKETS, "Tags", tagNames);
+
     var existing = findTicketPage_(ticket.id);
+    Logger.log("Upsert ticket " + ticket.id + " => " + (existing ? "UPDATE" : "CREATE"));
 
     if (existing) {
       notion.updatePage(existing.id, properties);
