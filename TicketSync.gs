@@ -15,13 +15,15 @@
 // Leave blank to use the value from Script Properties.
 var CLIENTS_DB_ID_OVERRIDE = "2bef5364-d1df-8001-9ed9-e137d9409b1a";
 
+// Notion API version is pinned in code so we always target the new data_sources endpoints.
+var NOTION_VERSION = "2025-09-03";
+
 function getConfig_() {
   const props = PropertiesService.getScriptProperties();
   const required = [
     "TEAMWORK_SITE",
     "TEAMWORK_DESK_API_KEY",
     "NOTION_TOKEN",
-    "NOTION_VERSION",
     "NOTION_DB_TICKETS",
     "NOTION_CLIENTS_DB_ID",
     "NOTION_CONTACTS_DB_ID",
@@ -155,7 +157,7 @@ function TeamworkDeskClient_(cfg) {
 function NotionClient_(cfg) {
   var headers = buildHeaders_({
     Authorization: "Bearer " + cfg.NOTION_TOKEN,
-    "Notion-Version": cfg.NOTION_VERSION
+    "Notion-Version": NOTION_VERSION
   });
   var normalizeDbId_ = function (dbId) {
     var cleaned = String(dbId || "").trim();
@@ -172,7 +174,7 @@ function NotionClient_(cfg) {
         number: { equals: Number(numberValue) }
       }
     };
-    return fetchWithBackoff_("https://api.notion.com/v1/databases/" + cleanDbId + "/query", {
+    return fetchWithBackoff_("https://api.notion.com/v1/data_sources/" + cleanDbId + "/query", {
       method: "post",
       headers: headers,
       payload: JSON.stringify(body),
@@ -189,7 +191,7 @@ function NotionClient_(cfg) {
         select: { equals: value }
       }
     };
-    return fetchWithBackoff_("https://api.notion.com/v1/databases/" + cleanDbId + "/query", {
+    return fetchWithBackoff_("https://api.notion.com/v1/data_sources/" + cleanDbId + "/query", {
       method: "post",
       headers: headers,
       payload: JSON.stringify(body),
@@ -202,7 +204,7 @@ function NotionClient_(cfg) {
     return fetchWithBackoff_("https://api.notion.com/v1/pages", {
       method: "post",
       headers: headers,
-      payload: JSON.stringify({ parent: { database_id: cleanDbId }, properties: properties }),
+      payload: JSON.stringify({ parent: { data_source_id: cleanDbId }, properties: properties }),
       muteHttpExceptions: true
     }, 3, 800);
   }
@@ -341,11 +343,11 @@ function SyncEngine_(cfg, desk, notion) {
       var email = emailKeys[i];
       var checks = ["Email", "Secondary Email", "Email 3", "Email 4"];
       for (var j = 0; j < checks.length; j++) {
-        var res = fetchWithBackoff_("https://api.notion.com/v1/databases/" + cfg.NOTION_CONTACTS_DB_ID + "/query", {
+        var res = fetchWithBackoff_("https://api.notion.com/v1/data_sources/" + cfg.NOTION_CONTACTS_DB_ID + "/query", {
           method: "post",
           headers: buildHeaders_({
             Authorization: "Bearer " + cfg.NOTION_TOKEN,
-            "Notion-Version": cfg.NOTION_VERSION
+            "Notion-Version": NOTION_VERSION
           }),
           payload: JSON.stringify({
             page_size: 1,
@@ -358,11 +360,11 @@ function SyncEngine_(cfg, desk, notion) {
     }
 
     if (contact.name) {
-      var resName = fetchWithBackoff_("https://api.notion.com/v1/databases/" + cfg.NOTION_CONTACTS_DB_ID + "/query", {
+      var resName = fetchWithBackoff_("https://api.notion.com/v1/data_sources/" + cfg.NOTION_CONTACTS_DB_ID + "/query", {
         method: "post",
         headers: buildHeaders_({
           Authorization: "Bearer " + cfg.NOTION_TOKEN,
-          "Notion-Version": cfg.NOTION_VERSION
+          "Notion-Version": NOTION_VERSION
         }),
         payload: JSON.stringify({
           page_size: 1,
