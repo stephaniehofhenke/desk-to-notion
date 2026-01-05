@@ -98,6 +98,7 @@ function notifyFailure_(functionName, err) {
 function nightlyContactsSync_() {
   const notion = notionClient_();
   const desk = deskClient_();
+  const deskIdPropName = notion.deskIdPropName || CONTACT_DESK_ID_PROP;
 
   const clientsDbId = getProp_("NOTION_CLIENTS_DB_ID");
   let cursor = null;
@@ -197,7 +198,7 @@ function nightlyContactsSync_() {
             }
           }
 
-          const existingDeskId = notion.getDeskContactId_(cp[CONTACT_DESK_ID_PROP]);
+          const existingDeskId = notion.getDeskContactId_(cp[deskIdPropName]);
           if (existingDeskId !== null && existingDeskId !== undefined) {
             console.log(`Skip Desk customer create; contact already has Desk Contact ID=${existingDeskId}. contactId=${c.id}`);
             continue;
@@ -313,7 +314,7 @@ function cleanupContactsSync_() {
     for (const page of pages) {
       processed++;
       const props = page.properties || {};
-      const existingDeskId = notion.getDeskContactId_(props[CONTACT_DESK_ID_PROP]);
+      const existingDeskId = notion.getDeskContactId_(props[deskIdPropName]);
       const contactTitle = notion.getTitleOrText_(props[CONTACT_TITLE_PROP]) || "(Untitled)";
 
       if (existingDeskId !== null && existingDeskId !== undefined) {
@@ -583,21 +584,27 @@ function notionClient_() {
     "Content-Type": "application/json"
   };
 
-  assertDeskIdPropertyExists_();
+  const deskIdPropName = resolveDeskIdPropertyName_();
 
-  function assertDeskIdPropertyExists_() {
+  function normalizePropName_(name) {
+    return (name || "").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+
+  function resolveDeskIdPropertyName_() {
     const db = fetchJson_(`https://api.notion.com/v1/databases/${contactsDbId}`, "get", headers, null, 3, 600);
     const props = db.properties || {};
-    const prop = props[CONTACT_DESK_ID_PROP];
+    const propNames = Object.keys(props);
+    const sortedPropNames = propNames.sort();
+    const normalizedTarget = normalizePropName_(CONTACT_DESK_ID_PROP);
+    const resolvedName = propNames.find((name) => normalizePropName_(name) === normalizedTarget);
+    const prop = resolvedName ? props[resolvedName] : null;
     const dbTitle = (db.title || []).map(t => t.plain_text || "").join("");
     const dbId = db.id || contactsDbId;
-    const sortedPropNames = Object.keys(props).sort();
-    const normalizedTarget = (CONTACT_DESK_ID_PROP || "").trim().toLowerCase();
     if (!prop || prop.type !== "number") {
       console.log(`Contacts DB title="${dbTitle}" id=${dbId}`);
       console.log(`Properties (${sortedPropNames.length}): ${sortedPropNames.join(", ")}`);
       if (!prop) {
-        const nearMatches = sortedPropNames.filter(n => (n || "").trim().toLowerCase() === normalizedTarget);
+        const nearMatches = sortedPropNames.filter(n => normalizePropName_(n) === normalizedTarget);
         if (nearMatches.length) {
           console.log(`Near-matching property names for "${CONTACT_DESK_ID_PROP}": ${nearMatches.join(", ")}`);
         }
@@ -607,6 +614,12 @@ function notionClient_() {
       const actualType = prop ? `"${prop.type || "unknown"}"` : "missing";
       throw new Error(`Required Notion property "${CONTACT_DESK_ID_PROP}" must be type "number" (actual: ${actualType})`);
     }
+
+    if (resolvedName && resolvedName !== CONTACT_DESK_ID_PROP) {
+      console.log(`Resolved Desk Contact ID property name to "${resolvedName}" (expected "${CONTACT_DESK_ID_PROP}").`);
+    }
+
+    return resolvedName || CONTACT_DESK_ID_PROP;
   }
 
   function normalizeDeskId_(deskId) {
@@ -617,7 +630,7 @@ function notionClient_() {
   }
 
   function ensureDeskIdProp_(properties) {
-    const prop = properties && properties[CONTACT_DESK_ID_PROP];
+    const prop = properties && properties[deskIdPropName];
     if (!prop || prop.type !== "number") {
       throw new Error(`Missing Notion property "${CONTACT_DESK_ID_PROP}" on contact page`);
     }
@@ -645,7 +658,7 @@ function notionClient_() {
     }
 
     fetchJson_(`https://api.notion.com/v1/pages/${contactPageId}`, "patch", headers, {
-      properties: { [CONTACT_DESK_ID_PROP]: { number: deskIdNum } }
+      properties: { [deskIdPropName]: { number: deskIdNum } }
     }, 3, 600);
     prop.number = deskIdNum;
     return { updated: true };
@@ -653,6 +666,8 @@ function notionClient_() {
 
   return {
     dbQuery: (dbId, body) => fetchJson_(`https://api.notion.com/v1/databases/${dbId}/query`, "post", headers, body),
+
+    deskIdPropName,
 
     getContactsDbId: () => contactsDbId,
 
@@ -685,7 +700,7 @@ function notionClient_() {
         [CONTACT_EMAIL_PROP]: { email }
       };
 
-      if (deskIdNum !== null) properties[CONTACT_DESK_ID_PROP] = { number: deskIdNum };
+      if (deskIdNum !== null) properties[deskIdPropName] = { number: deskIdNum };
 
       const res = fetchJson_(`https://api.notion.com/v1/pages`, "post", headers, {
         parent: { database_id: contactsDbId },
