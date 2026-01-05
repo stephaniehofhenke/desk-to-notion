@@ -296,6 +296,7 @@ function nightlyContactsSync_() {
 function cleanupContactsSync_() {
   const notion = notionClient_();
   const desk = deskClient_();
+  const deskIdPropName = notion.deskIdPropName || CONTACT_DESK_ID_PROP;
 
   const contactsDbId = notion.getContactsDbId();
   let cursor = null;
@@ -584,25 +585,50 @@ function notionClient_() {
     "Content-Type": "application/json"
   };
 
-  const deskIdPropName = resolveDeskIdPropertyName_();
+  const contactsDataSourceId = getDataSourceIdForDb_(contactsDbId);
+  const deskIdPropName = resolveDeskIdPropertyName_(contactsDataSourceId);
 
   function normalizePropName_(name) {
     return (name || "").replace(/\s+/g, " ").trim().toLowerCase();
   }
 
-  function resolveDeskIdPropertyName_() {
-    const db = fetchJson_(`https://api.notion.com/v1/databases/${contactsDbId}`, "get", headers, null, 3, 600);
-    const props = db.properties || {};
+  function getDataSourceIdForDb_(dbId) {
+    let db;
+    try {
+      db = fetchJson_(`https://api.notion.com/v1/databases/${dbId}`, "get", headers, null, 3, 600);
+    } catch (e) {
+      throw new Error(`Failed to load Notion database ${dbId} data sources: ${e && e.message ? e.message : e}`);
+    }
+    const dataSources = db.data_sources || [];
+    if (!dataSources.length || !dataSources[0].id) {
+      throw new Error(`No data sources found for Notion database ${dbId}`);
+    }
+    return dataSources[0].id;
+  }
+
+  function getDataSourceSchema_(dataSourceId) {
+    return fetchJson_(`https://api.notion.com/v1/data_sources/${dataSourceId}`, "get", headers, null, 3, 600);
+  }
+
+  function dataSourceQuery_(dataSourceId, body, retries, backoffMs) {
+    return fetchJson_(`https://api.notion.com/v1/data_sources/${dataSourceId}/query`, "post", headers, body, retries, backoffMs);
+  }
+
+  function resolveDeskIdPropertyName_(contactsDsId) {
+    const dsSchema = getDataSourceSchema_(contactsDsId);
+    const props = dsSchema.properties || {};
     const propNames = Object.keys(props);
     const sortedPropNames = propNames.sort();
     const normalizedTarget = normalizePropName_(CONTACT_DESK_ID_PROP);
     const resolvedName = propNames.find((name) => normalizePropName_(name) === normalizedTarget);
     const prop = resolvedName ? props[resolvedName] : null;
-    const dbTitle = (db.title || []).map(t => t.plain_text || "").join("");
-    const dbId = db.id || contactsDbId;
+    const dbTitle = (dsSchema.database && dsSchema.database.title ? dsSchema.database.title : []).map(t => t.plain_text || "").join("");
+    const dbId = (dsSchema.database && (dsSchema.database.id || dsSchema.database.database_id)) || contactsDbId;
     if (!prop || prop.type !== "number") {
-      console.log(`Contacts DB title="${dbTitle}" id=${dbId}`);
-      console.log(`Properties (${sortedPropNames.length}): ${sortedPropNames.join(", ")}`);
+      console.log(`Contacts DB title="${dbTitle || "(unknown)"}" id=${dbId}`);
+      console.log(`Data source id=${contactsDsId}`);
+      const propSummaries = sortedPropNames.map((name) => `${name} [${props[name]?.type || "unknown"}]`);
+      console.log(`Properties (${propSummaries.length}): ${propSummaries.join(", ")}`);
       if (!prop) {
         const nearMatches = sortedPropNames.filter(n => normalizePropName_(n) === normalizedTarget);
         if (nearMatches.length) {
@@ -665,7 +691,10 @@ function notionClient_() {
   }
 
   return {
-    dbQuery: (dbId, body) => fetchJson_(`https://api.notion.com/v1/databases/${dbId}/query`, "post", headers, body),
+    dbQuery: (dbId, body) => {
+      const dataSourceId = getDataSourceIdForDb_(dbId);
+      return dataSourceQuery_(dataSourceId, body);
+    },
 
     deskIdPropName,
 
@@ -683,7 +712,7 @@ function notionClient_() {
     findContactByAnyEmail: (email) => {
       const checks = [CONTACT_EMAIL_PROP, CONTACT_EMAIL2_PROP, CONTACT_EMAIL3_PROP, CONTACT_EMAIL4_PROP];
       for (const propName of checks) {
-        const res = fetchJson_(`https://api.notion.com/v1/databases/${contactsDbId}/query`, "post", headers, {
+        const res = dataSourceQuery_(contactsDataSourceId, {
           page_size: 1,
           filter: { property: propName, email: { equals: email } }
         }, 3, 600);
