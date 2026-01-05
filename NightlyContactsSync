@@ -25,6 +25,7 @@ const CONTACT_EMAIL2_PROP = "Secondary Email";
 const CONTACT_EMAIL3_PROP = "Email 3";
 const CONTACT_EMAIL4_PROP = "Email 4";
 const CONTACT_DESK_ID_PROP = "Desk Contact ID";
+const CLEANUP_CONTACTS_CURSOR_PROP = "CLEANUP_CONTACTS_CURSOR";
 
 // ===== Settings =====
 const SYNC = {
@@ -181,7 +182,7 @@ function nightlyContactsSync_() {
           if (SYNC.TRY_SECONDARY_EMAIL_UPDATE) {
             const match = desk.findCustomerByNameAndCompany(nameParts.firstName, nameParts.lastName, Number(deskCompanyId));
             if (match && match.id) {
-              const deskIdResult = notion.setContactDeskIdIfEmpty(c.id, cp, match.id);
+              const deskIdResult = notion.setContactDeskId(c.id, cp, match.id, { overwrite: true });
               if (deskIdResult && deskIdResult.conflict) {
                 console.log(`Skip secondary-email add due to Desk Contact ID conflict (existing=${deskIdResult.existing}, new=${match.id}) contactId=${c.id}`);
                 continue;
@@ -208,7 +209,7 @@ function nightlyContactsSync_() {
           } else {
             const newDeskId = desk.createCustomer(email, nameParts.firstName, nameParts.lastName, Number(deskCompanyId));
             console.log(`${createLog} | deskId=${newDeskId}`);
-            notion.setContactDeskIdIfEmpty(c.id, cp, newDeskId);
+            notion.setContactDeskId(c.id, cp, newDeskId, { overwrite: true });
           }
           Utilities.sleep(SYNC.SLEEP_MS);
         }
@@ -233,12 +234,8 @@ function nightlyContactsSync_() {
           const existingByEmail = notion.findContactByAnyEmail(email);
           if (existingByEmail) {
             const existingProps = existingByEmail.properties || {};
-            const deskIdResult = notion.setContactDeskIdIfEmpty(existingByEmail.id, existingProps, dc.id);
-            if (deskIdResult && deskIdResult.conflict) {
-              console.log(`Skip relating contactId=${existingByEmail.id} due to Desk Contact ID conflict (existing=${deskIdResult.existing}, new=${dc.id})`);
-              continue;
-            }
-
+            const deskIdResult = notion.setContactDeskId(existingByEmail.id, existingProps, dc.id, { overwrite: true });
+            
             console.log(`Found existing Notion contact by email; leaving client relation unchanged: ${email} → ${clientName} | deskId=${dc.id}`);
             notionEmailSet.add(email);
             continue;
@@ -249,11 +246,7 @@ function nightlyContactsSync_() {
 
           if (matches.length === 1) {
             const matchPage = matches[0];
-            const deskIdResult = notion.setContactDeskIdIfEmpty(matchPage.id, matchPage.properties, dc.id);
-            if (deskIdResult && deskIdResult.conflict) {
-              console.log(`Desk Contact ID mismatch on contactId=${matchPage.id}. existing=${deskIdResult.existing} new=${dc.id}. Skipping email write.`);
-              continue;
-            }
+            notion.setContactDeskId(matchPage.id, matchPage.properties, dc.id, { overwrite: true });
 
             console.log(`Name-match found. Fill next empty email slot: ${email} | deskId=${dc.id}`);
 
@@ -297,11 +290,17 @@ function cleanupContactsSync_() {
   const deskIdPropName = notion.deskIdPropName || CONTACT_DESK_ID_PROP;
 
   const contactsDbId = notion.getContactsDbId();
-  let cursor = null;
+  const scriptProps = PropertiesService.getScriptProperties();
+  const savedCursor = scriptProps.getProperty(CLEANUP_CONTACTS_CURSOR_PROP);
+  let cursor = savedCursor || null;
   let processed = 0;
   let updated = 0;
 
   console.log(`=== Cleanup Contact Sync start === DRY_RUN=${SYNC.DRY_RUN}`);
+
+  if (cursor) {
+    console.log(`Resuming cleanup from stored cursor.`);
+  }
 
   while (true) {
     const query = { page_size: 100 };
@@ -354,12 +353,20 @@ function cleanupContactsSync_() {
       }
 
       const deskId = uniqueIds[0];
-      const result = notion.setContactDeskIdIfEmpty(page.id, props, deskId);
+      const result = notion.setContactDeskId(page.id, props, deskId, { overwrite: true });
       if (result && result.updated) {
         updated++;
       }
 
       console.log(`Backfill Desk Contact ID=${deskId} on contact "${contactTitle}" (contactId=${page.id})`);
+    }
+
+    if (!SYNC.DRY_RUN) {
+      if (res.has_more && res.next_cursor) {
+        scriptProps.setProperty(CLEANUP_CONTACTS_CURSOR_PROP, res.next_cursor);
+      } else {
+        scriptProps.deleteProperty(CLEANUP_CONTACTS_CURSOR_PROP);
+      }
     }
 
     if (!res.has_more) break;
@@ -661,31 +668,34 @@ function notionClient_() {
     return prop;
   }
 
-  function setDeskIdIfEmpty_(contactPageId, properties, deskId) {
+  function setDeskId_(contactPageId, properties, deskId, options) {
     const deskIdNum = normalizeDeskId_(deskId);
     if (deskIdNum === null) return { updated: false, reason: "invalid" };
 
     const prop = ensureDeskIdProp_(properties);
     const existing = prop.number;
 
+    const overwrite = options && options.overwrite;
+
     if (existing === deskIdNum) return { updated: false, reason: "same" };
 
-    if (existing !== null && existing !== undefined) {
+    if (existing !== null && existing !== undefined && !overwrite) {
       console.log(`Desk Contact ID already set (${existing}) differs from ${deskIdNum}. contactId=${contactPageId}. Skipping update.`);
       return { updated: false, conflict: true, existing };
     }
 
-    console.log(`Set Desk Contact ID=${deskIdNum} → contactId=${contactPageId}`);
+    const action = existing !== null && existing !== undefined ? "Update" : "Set";
+    console.log(`${action} Desk Contact ID=${deskIdNum} → contactId=${contactPageId}`);
     if (SYNC.DRY_RUN) {
       prop.number = deskIdNum;
-      return { updated: false, reason: "dry_run" };
+      return { updated: false, reason: "dry_run", overwritten: existing !== null && existing !== undefined };
     }
 
     fetchJson_(`https://api.notion.com/v1/pages/${contactPageId}`, "patch", headers, {
       properties: { [deskIdPropName]: { number: deskIdNum } }
     }, 3, 600);
     prop.number = deskIdNum;
-    return { updated: true };
+    return { updated: true, overwritten: existing !== null && existing !== undefined };
   }
 
   return {
@@ -761,7 +771,8 @@ function notionClient_() {
       return true;
     },
 
-    setContactDeskIdIfEmpty: (contactPageId, properties, deskId) => setDeskIdIfEmpty_(contactPageId, properties, deskId),
+    setContactDeskId: (contactPageId, properties, deskId, options) => setDeskId_(contactPageId, properties, deskId, options),
+    setContactDeskIdIfEmpty: (contactPageId, properties, deskId) => setDeskId_(contactPageId, properties, deskId, { overwrite: false }),
 
     // Read helpers
     getClientTitle_: (properties) => {
