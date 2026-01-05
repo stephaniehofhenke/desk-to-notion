@@ -8,12 +8,10 @@
  * - If email exists in Desk anywhere (primary OR contact methods) -> do nothing
  * - Only create Desk customer if truly missing
  * - Skip wordpress/webmaster + *.stringmarketing.com subdomain emails
- *
+ * - NOTION_VERSION has already been determined
  * Desk API usage:
  * - GET /desk/api/v2/search/customers.json supports includes=contacts and companies[] filters
  *******************************************************/
-
-const NOTION_VERSION = "2025-09-03";
 
 // ===== Clients DB =====
 const CLIENTS_TITLE_PROP = "Business Name";
